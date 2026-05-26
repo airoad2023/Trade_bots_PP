@@ -1,0 +1,1128 @@
+"""
+pumpportal_balanced_10k_paper_bot.py
+
+Low-cost PumpPortal PAPER TRADE bot using the Balanced 10K rule.
+
+IMPORTANT
+---------
+- PAPER TRADING ONLY. This script does NOT buy or sell real tokens.
+- No MySQL / external database required.
+- Uses one PumpPortal WebSocket connection.
+- Uses subscribeNewToken to detect launches for free.
+- Opens subscribeTokenTrade only at ~5:00 after launch as a paid probe.
+- If first paid market-cap update is below $10,000, it unsubscribes immediately.
+- If first paid market-cap update is >= $10,000, it keeps the stream for 5:15 / 5:30 / entry / exit.
+- Paper investment is €10 by default.
+
+Install
+-------
+    pip install websockets python-dotenv
+
+Create a .env file in the same folder:
+    PUMPPORTAL_API_KEY=your_key_here
+
+Run
+---
+    python pumpportal_balanced_10k_paper_bot.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import csv
+import json
+import math
+import os
+import signal
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # python-dotenv is optional
+    load_dotenv = None
+
+try:
+    import websockets
+except ImportError:
+    print("Missing package: websockets")
+    print("Install with: pip install websockets python-dotenv")
+    sys.exit(1)
+
+if load_dotenv:
+    load_dotenv()
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+PUMPPORTAL_API_KEY = os.getenv("PUMPPORTAL_API_KEY", "c94k6wb58d372j9fatqmmpjc6d574rup6rr4cckq8mr52wthet136gjtcnb32d315duk0kv389970rk1dt8n2gbp9hr6mwbb6x9mahju85v78k3ed9546ta8chw50y9b6da5jvbda4ykudhp4pkkfe1c4pthnad7q6j3heg8t448k3g95q70pkcexb68vkd6nr78gkg6xvkuf8").strip()
+PUMPPORTAL_WS_URL = f"wss://pumpportal.fun/api/data?api-key={PUMPPORTAL_API_KEY}"
+
+# Paper account
+START_BALANCE_EUR = float(os.getenv("START_BALANCE_EUR", "10"))
+POSITION_SIZE_EUR = float(os.getenv("POSITION_SIZE_EUR", "10"))
+COMPOUND_BALANCE = os.getenv("COMPOUND_BALANCE", "true").lower() == "true"
+ONE_POSITION_AT_A_TIME = os.getenv("ONE_POSITION_AT_A_TIME", "true").lower() == "true"
+SESSION_PROFIT_TARGET_PCT = float(os.getenv("SESSION_PROFIT_TARGET_PCT", "30"))
+
+# Market-cap conversion. Update this in .env if SOL changes.
+SOL_TO_USD = float(os.getenv("SOL_TO_USD", "84.39"))
+
+# Safer 10K rule thresholds from the Word file
+MIN_MARKET_CAP_USD_500 = float(os.getenv("MIN_MARKET_CAP_USD_500", "10000"))
+MIN_MARKET_CAP_USD_515 = float(os.getenv("MIN_MARKET_CAP_USD_515", "10000"))
+MIN_NEW_BUYERS_500_TO_530 = int(os.getenv("MIN_NEW_BUYERS_500_TO_530", "10"))
+MIN_BUYER_GROWTH_ADVANTAGE = int(os.getenv("MIN_BUYER_GROWTH_ADVANTAGE", "0"))
+MIN_BUYER_SELLER_RATIO_530 = float(os.getenv("MIN_BUYER_SELLER_RATIO_530", "1.5"))
+MAX_CREATOR_SELL_SHARE_PCT = float(os.getenv("MAX_CREATOR_SELL_SHARE_PCT", "15"))
+REQUIRE_POSITIVE_NET_VOLUME_530 = os.getenv("REQUIRE_POSITIVE_NET_VOLUME_530", "false").lower() == "true"
+USE_TOP_BUYER_FILTER = os.getenv("USE_TOP_BUYER_FILTER", "false").lower() == "true"
+MAX_TOP_BUYER_SHARE_PCT = float(os.getenv("MAX_TOP_BUYER_SHARE_PCT", "20"))
+
+# Balanced-rule relaxation switches.
+# Default = relaxed, because the historical best balanced rule used:
+# 5:15 market cap > $10k
+# 5:30 new_buyers >= 10
+# 5:30 buyer_advantage >= 0
+# 5:30 buyer/seller ratio >= 1.5
+REQUIRE_CREATOR_SELL_FILTER = os.getenv("REQUIRE_CREATOR_SELL_FILTER", "false").lower() == "true"
+REQUIRE_5_15_ABOVE_500_REFERENCE = os.getenv("REQUIRE_5_15_ABOVE_500_REFERENCE", "false").lower() == "true"
+REQUIRE_5_15_POSITIVE_NET_VOLUME = os.getenv("REQUIRE_5_15_POSITIVE_NET_VOLUME", "false").lower() == "true"
+REQUIRE_5_30_ABOVE_500_REFERENCE = os.getenv("REQUIRE_5_30_ABOVE_500_REFERENCE", "false").lower() == "true"
+
+# Time checkpoints after launch
+AGE_500 = float(os.getenv("AGE_500", "300"))      # 5:00
+AGE_515 = float(os.getenv("AGE_515", "315"))      # 5:15
+AGE_530 = float(os.getenv("AGE_530", "330"))      # 5:30
+AGE_535 = float(os.getenv("AGE_535", "335"))      # 5:35 entry
+AGE_545 = float(os.getenv("AGE_545", "345"))      # 5:45 first danger check
+FINAL_EXIT_AGE_SECONDS = float(os.getenv("FINAL_EXIT_AGE_SECONDS", "405"))  # 6:45
+
+# Exit rules
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "15"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-15"))
+DANGER_EXIT_ENABLED = os.getenv("DANGER_EXIT_ENABLED", "false").lower() == "true"
+
+# Paid probe behavior
+PROBE_TIMEOUT_SECONDS = float(os.getenv("PROBE_TIMEOUT_SECONDS", "60"))
+TOKEN_CLEANUP_AGE_SECONDS = float(os.getenv("TOKEN_CLEANUP_AGE_SECONDS", "900"))
+MAX_TRACKED_TOKENS = int(os.getenv("MAX_TRACKED_TOKENS", "500"))
+
+# Cost controls from the Word file
+MAX_PAID_SUBSCRIPTIONS_PER_HOUR = int(os.getenv("MAX_PAID_SUBSCRIPTIONS_PER_HOUR", "1000"))
+MAX_ACTIVE_PAID_SUBSCRIPTIONS = int(os.getenv("MAX_ACTIVE_PAID_SUBSCRIPTIONS", "20"))
+MAX_PAID_MESSAGES_PER_HOUR = int(os.getenv("MAX_PAID_MESSAGES_PER_HOUR", "10000"))
+EST_SOL_COST_PER_10000_MESSAGES = float(os.getenv("EST_SOL_COST_PER_10000_MESSAGES", "0.01"))
+
+# Optional local-hour filter. Example: ACTIVE_ENTRY_HOURS=10,13,20
+ACTIVE_ENTRY_HOURS = [
+    int(x.strip())
+    for x in os.getenv("ACTIVE_ENTRY_HOURS", "").split(",")
+    if x.strip().isdigit()
+]
+
+# General reporting
+STATUS_EVERY_SECONDS = float(os.getenv("STATUS_EVERY_SECONDS", "30"))
+MAINTENANCE_EVERY_SECONDS = float(os.getenv("MAINTENANCE_EVERY_SECONDS", "1"))
+LOG_DIR = Path(os.getenv("LOG_DIR", "pumpportal_safer_10k_paper_logs"))
+EVENTS_CSV = LOG_DIR / "events.csv"
+REJECTIONS_CSV = LOG_DIR / "rejections.csv"
+TRADE_REPORTS_CSV = LOG_DIR / "trade_reports.csv"
+FINAL_REPORT_CSV = LOG_DIR / "final_report.csv"
+
+
+# ============================================================
+# DATA CLASSES
+# ============================================================
+
+@dataclass
+class TokenMetrics:
+    age: float
+    market_cap_usd: float
+    unique_buyers: int
+    unique_sellers: int
+    total_buy_sol: float
+    total_sell_sol: float
+    net_volume_sol: float
+    buyer_seller_ratio: float
+    buyer_advantage: int
+    creator_sell_sol: float
+    creator_sell_share_pct: float
+    top_buyer_share_pct: float
+    paid_messages: int
+
+
+@dataclass
+class TokenState:
+    mint: str
+    symbol: str = ""
+    name: str = ""
+    creator: str = ""
+    launch_monotonic: float = field(default_factory=time.monotonic)
+    launch_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    latest_market_cap_sol: Optional[float] = None
+    latest_market_cap_usd: Optional[float] = None
+    latest_market_cap_updated_age: Optional[float] = None
+
+    paid_subscribed: bool = False
+    paid_subscription_started_utc: Optional[datetime] = None
+    paid_subscription_started_monotonic: Optional[float] = None
+    paid_subscription_stopped_utc: Optional[datetime] = None
+    paid_messages: int = 0
+
+    buyers: Set[str] = field(default_factory=set)
+    sellers: Set[str] = field(default_factory=set)
+    buyer_sol_volume: DefaultDict[str, float] = field(default_factory=lambda: defaultdict(float))
+    total_buy_sol: float = 0.0
+    total_sell_sol: float = 0.0
+    creator_sell_sol: float = 0.0
+
+    reference_500_market_cap_usd: Optional[float] = None
+    reference_500_set_age: Optional[float] = None
+    reference_515_market_cap_usd: Optional[float] = None
+    snap_515: Optional[TokenMetrics] = None
+    snap_530: Optional[TokenMetrics] = None
+
+    probe_started: bool = False
+    rejected: bool = False
+    evaluated_530: bool = False
+    ready_for_entry: bool = False
+    entered: bool = False
+    closed: bool = False
+    rejection_reason: str = ""
+
+    entry_buyers: Set[str] = field(default_factory=set)
+    entry_sellers: Set[str] = field(default_factory=set)
+    entry_total_buy_sol: float = 0.0
+    entry_total_sell_sol: float = 0.0
+
+    def age_seconds(self) -> float:
+        return time.monotonic() - self.launch_monotonic
+
+    def current_metrics(self) -> Optional[TokenMetrics]:
+        if self.latest_market_cap_usd is None:
+            return None
+
+        net_volume = self.total_buy_sol - self.total_sell_sol
+        buyer_advantage = len(self.buyers) - len(self.sellers)
+        ratio = buyer_seller_ratio(len(self.buyers), len(self.sellers))
+
+        creator_sell_share = 0.0
+        if self.total_sell_sol > 0:
+            creator_sell_share = (self.creator_sell_sol / self.total_sell_sol) * 100.0
+
+        top_buyer_share = 0.0
+        if self.total_buy_sol > 0 and self.buyer_sol_volume:
+            top_buyer_share = (max(self.buyer_sol_volume.values()) / self.total_buy_sol) * 100.0
+
+        return TokenMetrics(
+            age=self.age_seconds(),
+            market_cap_usd=self.latest_market_cap_usd,
+            unique_buyers=len(self.buyers),
+            unique_sellers=len(self.sellers),
+            total_buy_sol=self.total_buy_sol,
+            total_sell_sol=self.total_sell_sol,
+            net_volume_sol=net_volume,
+            buyer_seller_ratio=ratio,
+            buyer_advantage=buyer_advantage,
+            creator_sell_sol=self.creator_sell_sol,
+            creator_sell_share_pct=creator_sell_share,
+            top_buyer_share_pct=top_buyer_share,
+            paid_messages=self.paid_messages,
+        )
+
+    def post_entry_buy_sol(self) -> float:
+        return max(0.0, self.total_buy_sol - self.entry_total_buy_sol)
+
+    def post_entry_sell_sol(self) -> float:
+        return max(0.0, self.total_sell_sol - self.entry_total_sell_sol)
+
+    def post_entry_new_buyers(self) -> int:
+        return len(self.buyers - self.entry_buyers)
+
+    def post_entry_new_sellers(self) -> int:
+        return len(self.sellers - self.entry_sellers)
+
+
+@dataclass
+class PaperPosition:
+    mint: str
+    symbol: str
+    entry_time_utc: datetime
+    entry_age: float
+    entry_market_cap_usd: float
+    stake_eur: float
+    entry_reason: str
+    highest_market_cap_usd: float
+    lowest_market_cap_usd: float
+    highest_return_pct: float = 0.0
+    lowest_return_pct: float = 0.0
+
+
+@dataclass
+class TradeResult:
+    trade_no: int
+    mint: str
+    symbol: str
+    entry_time: str
+    exit_time: str
+    duration_seconds: int
+    entry_market_cap_usd: float
+    exit_market_cap_usd: float
+    exit_reason: str
+    return_pct: float
+    pnl_eur: float
+    success: bool
+    paid_messages: int
+    estimated_data_cost_sol: float
+    highest_return_pct: float
+    lowest_return_pct: float
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    if value is None:
+        return default
+    try:
+        if isinstance(value, str) and not value.strip():
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_str(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def get_first(data: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+    return default
+
+
+def extract_mint(data: Dict[str, Any]) -> str:
+    return safe_str(get_first(data, ["mint", "token", "tokenMint", "token_mint", "contractAddress", "ca"]))
+
+
+def extract_symbol(data: Dict[str, Any]) -> str:
+    return safe_str(get_first(data, ["symbol", "ticker", "tokenSymbol"]))
+
+
+def extract_name(data: Dict[str, Any]) -> str:
+    return safe_str(get_first(data, ["name", "tokenName"]))
+
+
+def extract_creator(data: Dict[str, Any]) -> str:
+    return safe_str(get_first(data, ["creator", "creatorPublicKey", "dev", "deployer", "traderPublicKey", "trader", "user"]))
+
+
+def extract_trader(data: Dict[str, Any]) -> str:
+    return safe_str(get_first(data, ["traderPublicKey", "trader", "user", "wallet", "maker", "account"]))
+
+
+def extract_tx_type(data: Dict[str, Any]) -> str:
+    raw = safe_str(get_first(data, ["txType", "type", "side", "action", "event"])).lower()
+    if "buy" in raw:
+        return "buy"
+    if "sell" in raw:
+        return "sell"
+    if "create" in raw or "new" in raw:
+        return "create"
+    if "migration" in raw:
+        return "migration"
+    return raw
+
+
+def extract_market_cap_sol(data: Dict[str, Any]) -> Optional[float]:
+    return safe_float(get_first(data, [
+        "marketCapSol", "market_cap_sol", "currentMarketCapSol",
+        "current_market_cap_sol", "marketcapSol", "marketCapSOL"
+    ]))
+
+
+def extract_sol_amount(data: Dict[str, Any]) -> float:
+    value = safe_float(get_first(data, [
+        "solAmount", "sol_amount", "amountSol", "amount_sol", "vSol", "sol", "nativeAmount"
+    ]), default=0.0)
+    return float(value or 0.0)
+
+
+def is_new_token_event(data: Dict[str, Any]) -> bool:
+    tx_type = extract_tx_type(data)
+    if tx_type == "create":
+        return True
+
+    has_mint = bool(extract_mint(data))
+    has_creation_fields = any(k in data for k in ["initialBuy", "bondingCurveKey", "name", "symbol"])
+    return has_mint and has_creation_fields and tx_type not in {"buy", "sell"}
+
+
+def buyer_seller_ratio(buyers: int, sellers: int) -> float:
+    if sellers <= 0:
+        return math.inf if buyers > 0 else 0.0
+    return buyers / sellers
+
+
+def percent_return(entry: float, current: float) -> float:
+    if entry <= 0:
+        return 0.0
+    return ((current / entry) - 1.0) * 100.0
+
+
+def estimated_sol_cost(messages: int) -> float:
+    return (messages / 10000.0) * EST_SOL_COST_PER_10000_MESSAGES
+
+
+def fmt_ratio(value: float) -> str:
+    if math.isinf(value):
+        return "inf"
+    return f"{value:.2f}"
+
+
+def ensure_log_files() -> None:
+    LOG_DIR.mkdir(exist_ok=True)
+
+    if not EVENTS_CSV.exists():
+        with EVENTS_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(["timestamp_utc", "event_type", "mint", "symbol", "message"])
+
+    if not REJECTIONS_CSV.exists():
+        with REJECTIONS_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "timestamp_utc", "mint", "symbol", "age", "reason", "paid_messages", "estimated_data_cost_sol"
+            ])
+
+    if not TRADE_REPORTS_CSV.exists():
+        with TRADE_REPORTS_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "trade_no", "mint", "symbol", "entry_time", "exit_time", "duration_seconds",
+                "entry_market_cap_usd", "exit_market_cap_usd", "exit_reason",
+                "return_pct", "pnl_eur", "success", "paid_messages", "estimated_data_cost_sol",
+                "highest_return_pct", "lowest_return_pct"
+            ])
+
+    if not FINAL_REPORT_CSV.exists():
+        with FINAL_REPORT_CSV.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "start_time_utc", "end_time_utc", "runtime_seconds",
+                "start_balance_eur", "end_balance_eur", "profit_loss_eur", "profit_loss_pct",
+                "total_trades", "wins", "losses", "success_rate_pct", "best_trade_pct", "worst_trade_pct",
+                "total_paid_messages", "estimated_total_data_cost_sol", "profit_target_reached"
+            ])
+
+
+def log_event(event_type: str, mint: str, symbol: str, message: str) -> None:
+    print(f"[{event_type}] {symbol or mint}: {message}")
+    with EVENTS_CSV.open("a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([now_utc().isoformat(timespec="seconds"), event_type, mint, symbol, message])
+
+
+def log_rejection(token: TokenState, reason: str) -> None:
+    token.rejected = True
+    token.rejection_reason = reason
+    with REJECTIONS_CSV.open("a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            now_utc().isoformat(timespec="seconds"),
+            token.mint,
+            token.symbol,
+            f"{token.age_seconds():.1f}",
+            reason,
+            token.paid_messages,
+            f"{estimated_sol_cost(token.paid_messages):.8f}",
+        ])
+    log_event("REJECT", token.mint, token.symbol, reason)
+
+
+# ============================================================
+# BOT
+# ============================================================
+
+class Balanced10KPaperBot:
+    def __init__(self) -> None:
+        if not PUMPPORTAL_API_KEY:
+            raise RuntimeError("PUMPPORTAL_API_KEY is missing. Add it to your .env file.")
+
+        self.tokens: Dict[str, TokenState] = {}
+        self.position: Optional[PaperPosition] = None
+        self.balance_eur = START_BALANCE_EUR
+        self.trade_no = 0
+        self.trades: List[TradeResult] = []
+
+        self.start_time = now_utc()
+        self.running = True
+        self.websocket = None
+
+        self.total_paid_messages = 0
+        self.hour_window_start = time.monotonic()
+        self.paid_subscriptions_this_hour = 0
+        self.paid_messages_this_hour = 0
+        self.last_status_ts = 0.0
+
+    def active_paid_subscriptions(self) -> int:
+        return sum(1 for token in self.tokens.values() if token.paid_subscribed and not token.closed and not token.rejected)
+
+    def reset_hour_window_if_needed(self) -> None:
+        if time.monotonic() - self.hour_window_start >= 3600:
+            self.hour_window_start = time.monotonic()
+            self.paid_subscriptions_this_hour = 0
+            self.paid_messages_this_hour = 0
+            log_event("COST_WINDOW_RESET", "", "", "Hourly paid subscription/message counters reset.")
+
+    def can_open_paid_subscription(self) -> Tuple[bool, str]:
+        self.reset_hour_window_if_needed()
+
+        if self.paid_subscriptions_this_hour >= MAX_PAID_SUBSCRIPTIONS_PER_HOUR:
+            return False, "hourly paid subscription limit reached"
+        if self.active_paid_subscriptions() >= MAX_ACTIVE_PAID_SUBSCRIPTIONS:
+            return False, "active paid subscription limit reached"
+        if self.paid_messages_this_hour >= MAX_PAID_MESSAGES_PER_HOUR:
+            return False, "hourly paid message limit reached"
+        return True, "allowed"
+
+    def hour_allowed(self) -> bool:
+        if not ACTIVE_ENTRY_HOURS:
+            return True
+        return datetime.now().hour in ACTIVE_ENTRY_HOURS
+
+    async def send_ws(self, payload: Dict[str, Any]) -> None:
+        if self.websocket is not None:
+            await self.websocket.send(json.dumps(payload))
+
+    async def subscribe_token_trade(self, token: TokenState) -> None:
+        if token.paid_subscribed or token.probe_started:
+            return
+
+        if not self.hour_allowed():
+            log_rejection(token, "local hour filter blocked paid probe")
+            return
+
+        allowed, reason = self.can_open_paid_subscription()
+        if not allowed:
+            log_rejection(token, f"cost limit reached: {reason}; not opening paid token-trade subscription")
+            return
+
+        await self.send_ws({"method": "subscribeTokenTrade", "keys": [token.mint]})
+        token.paid_subscribed = True
+        token.probe_started = True
+        token.paid_subscription_started_utc = now_utc()
+        token.paid_subscription_started_monotonic = time.monotonic()
+        self.paid_subscriptions_this_hour += 1
+
+        log_event(
+            "PAID_SUBSCRIBE",
+            token.mint,
+            token.symbol,
+            f"Started paid probe at age {token.age_seconds():.1f}s | "
+            f"active_paid={self.active_paid_subscriptions()} | "
+            f"subs_hour={self.paid_subscriptions_this_hour}/{MAX_PAID_SUBSCRIPTIONS_PER_HOUR}"
+        )
+
+    async def unsubscribe_token_trade(self, token: TokenState, reason: str) -> None:
+        if not token.paid_subscribed:
+            return
+        await self.send_ws({"method": "unsubscribeTokenTrade", "keys": [token.mint]})
+        token.paid_subscribed = False
+        token.paid_subscription_stopped_utc = now_utc()
+        log_event(
+            "PAID_UNSUBSCRIBE",
+            token.mint,
+            token.symbol,
+            f"{reason} | token_paid_messages={token.paid_messages} | "
+            f"estimated_cost={estimated_sol_cost(token.paid_messages):.8f} SOL"
+        )
+
+    async def handle_new_token(self, data: Dict[str, Any]) -> None:
+        if len(self.tokens) >= MAX_TRACKED_TOKENS:
+            return
+
+        mint = extract_mint(data)
+        if not mint or mint in self.tokens:
+            return
+
+        token = TokenState(
+            mint=mint,
+            symbol=extract_symbol(data),
+            name=extract_name(data),
+            creator=extract_creator(data),
+        )
+
+        mc_sol = extract_market_cap_sol(data)
+        if mc_sol is not None and mc_sol > 0:
+            token.latest_market_cap_sol = mc_sol
+            token.latest_market_cap_usd = mc_sol * SOL_TO_USD
+            token.latest_market_cap_updated_age = token.age_seconds()
+
+        self.tokens[mint] = token
+        log_event("NEW_TOKEN", mint, token.symbol, f"Tracking free only | active_tokens={len(self.tokens)}")
+
+    def update_token_from_trade_event(self, token: TokenState, data: Dict[str, Any]) -> None:
+        token.paid_messages += 1
+        self.total_paid_messages += 1
+        self.paid_messages_this_hour += 1
+
+        mc_sol = extract_market_cap_sol(data)
+        if mc_sol is not None and mc_sol > 0:
+            token.latest_market_cap_sol = mc_sol
+            token.latest_market_cap_usd = mc_sol * SOL_TO_USD
+            token.latest_market_cap_updated_age = token.age_seconds()
+
+        tx_type = extract_tx_type(data)
+        trader = extract_trader(data)
+        sol_amount = extract_sol_amount(data)
+
+        if tx_type == "buy":
+            if trader:
+                token.buyers.add(trader)
+                token.buyer_sol_volume[trader] += max(sol_amount, 0.0)
+            token.total_buy_sol += max(sol_amount, 0.0)
+
+        elif tx_type == "sell":
+            if trader:
+                token.sellers.add(trader)
+            token.total_sell_sol += max(sol_amount, 0.0)
+            if token.creator and trader and trader == token.creator:
+                token.creator_sell_sol += max(sol_amount, 0.0)
+
+    async def handle_trade_event(self, data: Dict[str, Any]) -> None:
+        mint = extract_mint(data)
+        if not mint:
+            return
+
+        token = self.tokens.get(mint)
+        if token is None or not token.paid_subscribed:
+            return
+
+        self.update_token_from_trade_event(token, data)
+
+        if self.paid_messages_this_hour == MAX_PAID_MESSAGES_PER_HOUR:
+            log_event(
+                "COST_LIMIT_HIT",
+                "",
+                "",
+                f"Paid messages reached {self.paid_messages_this_hour}/{MAX_PAID_MESSAGES_PER_HOUR}. "
+                "New paid subscriptions are blocked until the next hour."
+            )
+
+    async def handle_message(self, message: str) -> None:
+        try:
+            data = json.loads(message)
+        except Exception:
+            log_event("WS_NON_JSON", "", "", str(message)[:300])
+            return
+
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    await self.handle_message(json.dumps(item))
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        # Important: print API messages/errors so subscription problems are visible.
+        if data.get("message") or data.get("error"):
+            log_event("WS_MESSAGE", extract_mint(data), extract_symbol(data), json.dumps(data, ensure_ascii=False)[:1000])
+            return
+
+        if is_new_token_event(data):
+            await self.handle_new_token(data)
+            return
+
+        if extract_tx_type(data) in {"buy", "sell"}:
+            await self.handle_trade_event(data)
+
+    async def check_5min_paid_probe(self, token: TokenState) -> None:
+        if token.rejected or token.closed or token.entered:
+            return
+        if token.age_seconds() < AGE_500:
+            return
+        if token.probe_started:
+            return
+        await self.subscribe_token_trade(token)
+
+    async def check_probe_market_cap(self, token: TokenState) -> None:
+        if not token.probe_started or not token.paid_subscribed:
+            return
+        if token.reference_500_market_cap_usd is not None:
+            return
+
+        # The first paid trade event with market-cap data becomes the 5:00 reference.
+        if token.latest_market_cap_usd is not None and token.paid_messages > 0:
+            if token.latest_market_cap_usd >= MIN_MARKET_CAP_USD_500:
+                token.reference_500_market_cap_usd = token.latest_market_cap_usd
+                token.reference_500_set_age = token.age_seconds()
+                log_event(
+                    "CANDIDATE_5_00",
+                    token.mint,
+                    token.symbol,
+                    f"Passed $10K probe | reference_500_mc=${token.reference_500_market_cap_usd:,.2f} | "
+                    f"paid_messages={token.paid_messages}"
+                )
+            else:
+                await self.unsubscribe_token_trade(token, "below $10K at first paid 5:00 probe")
+                log_rejection(token, f"below $10K at first paid probe: ${token.latest_market_cap_usd:,.2f}")
+            return
+
+        if token.paid_subscription_started_monotonic:
+            waited = time.monotonic() - token.paid_subscription_started_monotonic
+            if waited >= PROBE_TIMEOUT_SECONDS:
+                await self.unsubscribe_token_trade(token, "probe timeout without market-cap trade update")
+                log_rejection(token, "probe timeout without market-cap trade update")
+
+    async def check_5_15_warning(self, token: TokenState) -> None:
+        if token.rejected or token.closed or token.entered:
+            return
+        if token.reference_500_market_cap_usd is None:
+            return
+        if token.snap_515 is not None:
+            return
+        if token.age_seconds() < AGE_515:
+            return
+
+        metrics = token.current_metrics()
+        if metrics is None:
+            return
+
+        token.snap_515 = metrics
+        token.reference_515_market_cap_usd = metrics.market_cap_usd
+
+        if metrics.market_cap_usd < MIN_MARKET_CAP_USD_515:
+            await self.unsubscribe_token_trade(token, "failed 5:15: below $10K")
+            log_rejection(token, f"5:15 market cap below $10K: ${metrics.market_cap_usd:,.2f}")
+            return
+
+        if REQUIRE_5_15_ABOVE_500_REFERENCE and metrics.market_cap_usd < token.reference_500_market_cap_usd:
+            await self.unsubscribe_token_trade(token, "failed 5:15: below 5:00 reference")
+            log_rejection(
+                token,
+                f"5:15 market cap below 5:00 reference | 5:15=${metrics.market_cap_usd:,.2f}, "
+                f"ref=${token.reference_500_market_cap_usd:,.2f}"
+            )
+            return
+
+        if REQUIRE_5_15_POSITIVE_NET_VOLUME and metrics.total_sell_sol > metrics.total_buy_sol and metrics.net_volume_sol <= 0:
+            await self.unsubscribe_token_trade(token, "failed 5:15: sell pressure / negative net volume")
+            log_rejection(token, "5:15 sell pressure: sell volume stronger and net volume <= 0")
+            return
+
+        log_event(
+            "WARNING_5_15_PASS",
+            token.mint,
+            token.symbol,
+            f"mc=${metrics.market_cap_usd:,.2f} | buyers={metrics.unique_buyers} | "
+            f"sellers={metrics.unique_sellers} | net={metrics.net_volume_sol:.4f} SOL"
+        )
+
+    def evaluate_safer_rule_5_30(self, token: TokenState) -> Tuple[bool, str]:
+        if token.reference_500_market_cap_usd is None:
+            return False, "missing 5:00 reference market cap"
+
+        metrics = token.current_metrics()
+        if metrics is None:
+            return False, "missing 5:30 metrics"
+
+        token.snap_530 = metrics
+
+        if REQUIRE_5_30_ABOVE_500_REFERENCE and metrics.market_cap_usd < token.reference_500_market_cap_usd:
+            return False, "5:30 market cap below 5:00 reference"
+
+        if metrics.unique_buyers < MIN_NEW_BUYERS_500_TO_530:
+            return False, f"new buyers too low: {metrics.unique_buyers} < {MIN_NEW_BUYERS_500_TO_530}"
+
+        if metrics.buyer_advantage < MIN_BUYER_GROWTH_ADVANTAGE:
+            return False, f"buyer growth advantage too low: {metrics.buyer_advantage} < {MIN_BUYER_GROWTH_ADVANTAGE}"
+
+        if metrics.buyer_seller_ratio < MIN_BUYER_SELLER_RATIO_530:
+            return False, f"buyer/seller ratio too low: {fmt_ratio(metrics.buyer_seller_ratio)} < {MIN_BUYER_SELLER_RATIO_530}"
+
+        if REQUIRE_CREATOR_SELL_FILTER and metrics.creator_sell_share_pct > MAX_CREATOR_SELL_SHARE_PCT:
+            return False, f"creator sell share too high: {metrics.creator_sell_share_pct:.2f}% > {MAX_CREATOR_SELL_SHARE_PCT:.2f}%"
+
+        if USE_TOP_BUYER_FILTER and metrics.top_buyer_share_pct > MAX_TOP_BUYER_SHARE_PCT:
+            return False, f"top buyer share too high: {metrics.top_buyer_share_pct:.2f}% > {MAX_TOP_BUYER_SHARE_PCT:.2f}%"
+
+        if REQUIRE_POSITIVE_NET_VOLUME_530 and metrics.net_volume_sol <= 0:
+            return False, f"net volume not positive: {metrics.net_volume_sol:.4f} SOL"
+
+        if REQUIRE_POSITIVE_NET_VOLUME_530 and metrics.total_buy_sol <= metrics.total_sell_sol:
+            return False, "buy volume not stronger than sell volume"
+
+        return True, (
+            f"Balanced rule passed | mc=${metrics.market_cap_usd:,.2f}, buyers={metrics.unique_buyers}, "
+            f"sellers={metrics.unique_sellers}, advantage={metrics.buyer_advantage}, "
+            f"ratio={fmt_ratio(metrics.buyer_seller_ratio)}, net={metrics.net_volume_sol:.4f} SOL, "
+            f"creator_sell={metrics.creator_sell_share_pct:.2f}%, top_buyer={metrics.top_buyer_share_pct:.2f}%"
+        )
+
+    async def check_5_30_confirmation(self, token: TokenState) -> None:
+        if token.rejected or token.closed or token.entered or token.evaluated_530:
+            return
+        if token.reference_500_market_cap_usd is None:
+            return
+        if token.age_seconds() < AGE_530:
+            return
+
+        token.evaluated_530 = True
+        passed, reason = self.evaluate_safer_rule_5_30(token)
+        if not passed:
+            await self.unsubscribe_token_trade(token, "failed 5:30 Safer rule")
+            log_rejection(token, reason)
+            return
+
+        token.ready_for_entry = True
+        log_event("BALANCED_PASS_5_30", token.mint, token.symbol, reason)
+
+    async def check_entry_5_35(self, token: TokenState) -> None:
+        if token.rejected or token.closed or token.entered:
+            return
+        if not token.ready_for_entry:
+            return
+        if token.age_seconds() < AGE_535:
+            return
+
+        if ONE_POSITION_AT_A_TIME and self.position is not None:
+            await self.unsubscribe_token_trade(token, "no paper position slot available")
+            log_rejection(token, "signal passed but another paper position is already open")
+            return
+
+        if token.latest_market_cap_usd is None:
+            await self.unsubscribe_token_trade(token, "missing market cap at entry")
+            log_rejection(token, "missing market cap at entry")
+            return
+
+        stake = min(POSITION_SIZE_EUR, self.balance_eur) if COMPOUND_BALANCE else POSITION_SIZE_EUR
+        if stake <= 0:
+            await self.unsubscribe_token_trade(token, "no paper balance available")
+            log_rejection(token, "no paper balance available")
+            return
+
+        token.entry_buyers = set(token.buyers)
+        token.entry_sellers = set(token.sellers)
+        token.entry_total_buy_sol = token.total_buy_sol
+        token.entry_total_sell_sol = token.total_sell_sol
+
+        self.position = PaperPosition(
+            mint=token.mint,
+            symbol=token.symbol,
+            entry_time_utc=now_utc(),
+            entry_age=token.age_seconds(),
+            entry_market_cap_usd=token.latest_market_cap_usd,
+            stake_eur=stake,
+            entry_reason="Balanced quality rule passed at 5:30; paper entry at 5:35",
+            highest_market_cap_usd=token.latest_market_cap_usd,
+            lowest_market_cap_usd=token.latest_market_cap_usd,
+        )
+        token.entered = True
+
+        log_event(
+            "PAPER_ENTRY",
+            token.mint,
+            token.symbol,
+            f"stake=€{stake:.2f} | entry_mc=${token.latest_market_cap_usd:,.2f} | age={token.age_seconds():.1f}s"
+        )
+
+    def danger_exit_reason(self, token: TokenState, pos: PaperPosition) -> Optional[str]:
+        if not DANGER_EXIT_ENABLED:
+            return None
+        if token.age_seconds() < AGE_545:
+            return None
+        if token.latest_market_cap_usd is None:
+            return None
+
+        # Prefer 5:15 reference after entry; fall back to 5:00 reference if 5:15 is missing.
+        safety_ref = token.reference_515_market_cap_usd or token.reference_500_market_cap_usd
+        if safety_ref and token.latest_market_cap_usd < safety_ref:
+            return "danger exit: market cap below safety reference"
+
+        post_buy = token.post_entry_buy_sol()
+        post_sell = token.post_entry_sell_sol()
+        post_net = post_buy - post_sell
+        post_new_buyers = token.post_entry_new_buyers()
+        post_new_sellers = token.post_entry_new_sellers()
+
+        if post_net < 0 and post_sell > post_buy:
+            return "danger exit: post-entry net volume negative"
+
+        if post_new_sellers > post_new_buyers and token.latest_market_cap_usd < pos.entry_market_cap_usd:
+            return "danger exit: sellers increasing faster and market cap below entry"
+
+        return None
+
+    async def check_exit(self, token: TokenState) -> None:
+        if self.position is None:
+            return
+        if self.position.mint != token.mint:
+            return
+        if token.latest_market_cap_usd is None:
+            return
+
+        pos = self.position
+        ret_pct = percent_return(pos.entry_market_cap_usd, token.latest_market_cap_usd)
+        pos.highest_return_pct = max(pos.highest_return_pct, ret_pct)
+        pos.lowest_return_pct = min(pos.lowest_return_pct, ret_pct)
+        pos.highest_market_cap_usd = max(pos.highest_market_cap_usd, token.latest_market_cap_usd)
+        pos.lowest_market_cap_usd = min(pos.lowest_market_cap_usd, token.latest_market_cap_usd)
+
+        reason: Optional[str] = None
+        if ret_pct >= TAKE_PROFIT_PCT:
+            reason = f"+{TAKE_PROFIT_PCT:.0f}% take profit"
+        elif ret_pct <= STOP_LOSS_PCT:
+            reason = f"{STOP_LOSS_PCT:.0f}% stop loss"
+        else:
+            reason = self.danger_exit_reason(token, pos)
+            if reason is None and token.age_seconds() >= FINAL_EXIT_AGE_SECONDS:
+                reason = "6:45 final exit"
+
+        if reason:
+            await self.close_trade(token, reason)
+
+    async def close_trade(self, token: TokenState, reason: str) -> None:
+        if self.position is None:
+            return
+
+        pos = self.position
+        exit_mc = token.latest_market_cap_usd or pos.entry_market_cap_usd
+        ret_pct = percent_return(pos.entry_market_cap_usd, exit_mc)
+        pnl_eur = pos.stake_eur * (ret_pct / 100.0)
+
+        self.balance_eur += pnl_eur
+        self.trade_no += 1
+        duration = int((now_utc() - pos.entry_time_utc).total_seconds())
+        success = pnl_eur > 0
+
+        result = TradeResult(
+            trade_no=self.trade_no,
+            mint=pos.mint,
+            symbol=pos.symbol,
+            entry_time=pos.entry_time_utc.isoformat(timespec="seconds"),
+            exit_time=now_utc().isoformat(timespec="seconds"),
+            duration_seconds=duration,
+            entry_market_cap_usd=pos.entry_market_cap_usd,
+            exit_market_cap_usd=exit_mc,
+            exit_reason=reason,
+            return_pct=ret_pct,
+            pnl_eur=pnl_eur,
+            success=success,
+            paid_messages=token.paid_messages,
+            estimated_data_cost_sol=estimated_sol_cost(token.paid_messages),
+            highest_return_pct=pos.highest_return_pct,
+            lowest_return_pct=pos.lowest_return_pct,
+        )
+        self.trades.append(result)
+
+        with TRADE_REPORTS_CSV.open("a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                result.trade_no, result.mint, result.symbol, result.entry_time, result.exit_time,
+                result.duration_seconds, f"{result.entry_market_cap_usd:.8f}",
+                f"{result.exit_market_cap_usd:.8f}", result.exit_reason, f"{result.return_pct:.4f}",
+                f"{result.pnl_eur:.4f}", "Yes" if result.success else "No", result.paid_messages,
+                f"{result.estimated_data_cost_sol:.8f}", f"{result.highest_return_pct:.4f}",
+                f"{result.lowest_return_pct:.4f}"
+            ])
+
+        print("\n" + "-" * 78)
+        print("TRADE REPORT")
+        print("-" * 78)
+        print(f"Trade: #{result.trade_no} | Token: {result.symbol or result.mint}")
+        print(f"Entry: {result.entry_time} | Exit: {result.exit_time} | Duration: {duration}s")
+        print(f"Entry MC: ${result.entry_market_cap_usd:,.2f} | Exit MC: ${result.exit_market_cap_usd:,.2f}")
+        print(f"Exit reason: {result.exit_reason}")
+        print(f"P/L: {result.return_pct:.2f}% | €{result.pnl_eur:.4f} | Success: {'Yes' if success else 'No'}")
+        print(f"Paid messages: {result.paid_messages} | Estimated data cost: {result.estimated_data_cost_sol:.8f} SOL")
+        print("-" * 78 + "\n")
+
+        await self.unsubscribe_token_trade(token, "trade closed")
+        token.closed = True
+        self.position = None
+
+    async def cleanup_old_tokens(self) -> None:
+        for mint, token in list(self.tokens.items()):
+            if self.position is not None and self.position.mint == mint:
+                continue
+            if token.age_seconds() < TOKEN_CLEANUP_AGE_SECONDS:
+                continue
+            if token.paid_subscribed:
+                await self.unsubscribe_token_trade(token, "cleanup old token")
+            self.tokens.pop(mint, None)
+
+    async def maintenance_loop(self) -> None:
+        while self.running:
+            try:
+                self.reset_hour_window_if_needed()
+                for token in list(self.tokens.values()):
+                    await self.check_5min_paid_probe(token)
+                    await self.check_probe_market_cap(token)
+                    await self.check_5_15_warning(token)
+                    await self.check_5_30_confirmation(token)
+                    await self.check_entry_5_35(token)
+                    await self.check_exit(token)
+
+                await self.cleanup_old_tokens()
+
+                if self.profit_pct() >= SESSION_PROFIT_TARGET_PCT:
+                    log_event("TARGET_REACHED", "", "", f"Paper profit target reached: {self.profit_pct():.2f}%")
+                    self.running = False
+                    break
+
+                if time.time() - self.last_status_ts >= STATUS_EVERY_SECONDS:
+                    self.print_status()
+                    self.last_status_ts = time.time()
+
+                await asyncio.sleep(MAINTENANCE_EVERY_SECONDS)
+            except Exception as exc:
+                log_event("MAINTENANCE_ERROR", "", "", repr(exc))
+                await asyncio.sleep(3)
+
+    async def websocket_loop(self) -> None:
+        reconnect_delay = 5
+        while self.running:
+            try:
+                async with websockets.connect(PUMPPORTAL_WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                    self.websocket = ws
+                    await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                    log_event("WS_CONNECTED", "", "", "Subscribed to free new-token stream.")
+                    async for message in ws:
+                        if not self.running:
+                            break
+                        await self.handle_message(message)
+            except Exception as exc:
+                log_event("WS_ERROR", "", "", f"{repr(exc)}; reconnecting in {reconnect_delay}s")
+                await asyncio.sleep(reconnect_delay)
+            finally:
+                self.websocket = None
+
+    def profit_pct(self) -> float:
+        return ((self.balance_eur / START_BALANCE_EUR) - 1.0) * 100.0 if START_BALANCE_EUR > 0 else 0.0
+
+    def print_status(self) -> None:
+        wins = sum(1 for result in self.trades if result.success)
+        losses = len(self.trades) - wins
+        success_rate = (wins / len(self.trades) * 100.0) if self.trades else 0.0
+        open_symbol = self.position.symbol if self.position else "none"
+        print(
+            f"[STATUS] tracked={len(self.tokens)} | active_paid={self.active_paid_subscriptions()} | "
+            f"open_position={open_symbol} | balance=€{self.balance_eur:.4f} | "
+            f"profit={self.profit_pct():.2f}% | trades={len(self.trades)} | "
+            f"success={success_rate:.2f}% | paid_msgs_hour={self.paid_messages_this_hour}/{MAX_PAID_MESSAGES_PER_HOUR} | "
+            f"subs_hour={self.paid_subscriptions_this_hour}/{MAX_PAID_SUBSCRIPTIONS_PER_HOUR}"
+        )
+
+    async def close_open_position_on_stop(self) -> None:
+        if self.position is None:
+            return
+        token = self.tokens.get(self.position.mint)
+        if token:
+            await self.close_trade(token, "manual stop final close")
+
+    def final_report(self) -> None:
+        end = now_utc()
+        runtime = int((end - self.start_time).total_seconds())
+        wins = sum(1 for result in self.trades if result.success)
+        losses = len(self.trades) - wins
+        success_rate = (wins / len(self.trades) * 100.0) if self.trades else 0.0
+        pnl = self.balance_eur - START_BALANCE_EUR
+        profit_pct = self.profit_pct()
+        best = max((result.return_pct for result in self.trades), default=0.0)
+        worst = min((result.return_pct for result in self.trades), default=0.0)
+        cost_sol = estimated_sol_cost(self.total_paid_messages)
+        target_reached = profit_pct >= SESSION_PROFIT_TARGET_PCT
+
+        print("\n" + "=" * 78)
+        print("FINAL PAPER BOT REPORT")
+        print("=" * 78)
+        print(f"Started: {self.start_time.isoformat(timespec='seconds')}")
+        print(f"Ended:   {end.isoformat(timespec='seconds')}")
+        print(f"Runtime: {runtime}s")
+        print(f"Start balance: €{START_BALANCE_EUR:.2f}")
+        print(f"End balance:   €{self.balance_eur:.4f}")
+        print(f"Total P/L:     €{pnl:.4f} ({profit_pct:.2f}%)")
+        print(f"Trades:        {len(self.trades)}")
+        print(f"Wins/Losses:   {wins}/{losses}")
+        print(f"Success rate:  {success_rate:.2f}%")
+        print(f"Best trade:    {best:.2f}%")
+        print(f"Worst trade:   {worst:.2f}%")
+        print(f"Paid messages: {self.total_paid_messages}")
+        print(f"Est. data cost:{cost_sol:.8f} SOL")
+        print(f"30% target:    {'Reached' if target_reached else 'Not reached'}")
+        print(f"Trade CSV:     {TRADE_REPORTS_CSV.resolve()}")
+        print(f"Final CSV:     {FINAL_REPORT_CSV.resolve()}")
+        print("=" * 78 + "\n")
+
+        with FINAL_REPORT_CSV.open("a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                self.start_time.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"), runtime,
+                f"{START_BALANCE_EUR:.4f}", f"{self.balance_eur:.4f}", f"{pnl:.4f}", f"{profit_pct:.4f}",
+                len(self.trades), wins, losses, f"{success_rate:.4f}", f"{best:.4f}", f"{worst:.4f}",
+                self.total_paid_messages, f"{cost_sol:.8f}", "Yes" if target_reached else "No"
+            ])
+
+    async def run(self) -> None:
+        ensure_log_files()
+
+        print("\nStarting PumpPortal Balanced 10K Paper Bot")
+        print("Mode: PAPER ONLY — no real buys/sells")
+        print(f"Start balance: €{START_BALANCE_EUR:.2f}")
+        print(f"Position size: €{POSITION_SIZE_EUR:.2f}")
+        print(f"SOL_TO_USD: ${SOL_TO_USD:.2f}")
+        print(f"5:00 candidate threshold: ${MIN_MARKET_CAP_USD_500:,.2f}")
+        print(f"Balanced rule: buyers>={MIN_NEW_BUYERS_500_TO_530}, advantage>={MIN_BUYER_GROWTH_ADVANTAGE}, "
+              f"ratio>={MIN_BUYER_SELLER_RATIO_530}, creator filter={REQUIRE_CREATOR_SELL_FILTER}")
+        print(f"Exits: +{TAKE_PROFIT_PCT:.0f}% TP, {STOP_LOSS_PCT:.0f}% SL, danger exit, 6:45 final exit")
+        print(f"Cost caps: {MAX_PAID_SUBSCRIPTIONS_PER_HOUR} paid subs/hour, "
+              f"{MAX_ACTIVE_PAID_SUBSCRIPTIONS} active paid subs, "
+              f"{MAX_PAID_MESSAGES_PER_HOUR} paid messages/hour")
+        print("Press CTRL+C to stop and print final report.\n")
+
+        loop = asyncio.get_running_loop()
+
+        def stop() -> None:
+            self.running = False
+            print("\nStop requested. Closing and reporting...")
+
+        try:
+            loop.add_signal_handler(signal.SIGINT, stop)
+            loop.add_signal_handler(signal.SIGTERM, stop)
+        except NotImplementedError:
+            pass  # Windows may not support add_signal_handler
+
+        ws_task = asyncio.create_task(self.websocket_loop())
+        maint_task = asyncio.create_task(self.maintenance_loop())
+
+        try:
+            while self.running:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            self.running = False
+
+        await self.close_open_position_on_stop()
+
+        for token in list(self.tokens.values()):
+            if token.paid_subscribed:
+                await self.unsubscribe_token_trade(token, "bot stopped")
+
+        for task in (ws_task, maint_task):
+            task.cancel()
+        await asyncio.gather(ws_task, maint_task, return_exceptions=True)
+        self.final_report()
+
+
+if __name__ == "__main__":
+    bot = Balanced10KPaperBot()
+    asyncio.run(bot.run())
